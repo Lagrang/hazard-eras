@@ -1,2 +1,2 @@
 # hazard-eras
-Hazard eras implementation in Rust
+Hazard eras implementation in Rust(WIP)
