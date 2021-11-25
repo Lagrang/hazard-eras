@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 #[repr(align(16))]
 pub struct StampedPointer<T> {
-    // TODO: add heap based implementation when cmpxchg16b not accessible
+    // TODO: add heap based implementation when cmpxchg16b is not supported
     ptr: UnsafeCell<u128>,
     phantom: PhantomData<T>,
 }

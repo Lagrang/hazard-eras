@@ -11,3 +11,6 @@ description = "Hazard eras based memory reclamation for Rust"
 keywords = ["concurrent", "garbage", "lock-free", "atomic"]
 categories = ["concurrency"]
 include = ["src/", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[dev-dependencies]
+rand = "0.8.3"

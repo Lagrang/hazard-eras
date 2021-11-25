@@ -11,10 +11,10 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::option::Option::Some;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::thread_local;
+use std::{ptr, thread_local};
 
 thread_local! {
-    // thread local map contains pointer to internals of inside hazard eras structure(address
+    // thread local map contains pointer to internal structures of hazard eras(address
     // of this structure is key of the hashmap)
     static HAZARD_TID: RefCell<HashMap<usize, (usize, usize)>> = RefCell::new(HashMap::new());
 }
@@ -103,9 +103,11 @@ impl<T> HazardObject<T> {
 pub struct Guard<'e> {
     eras: &'e HazardEras,
     active_pointers: Option<UnsafeCell<HashSet<*const HazardPtrReadState>>>,
+    instant_retire: bool,
 }
 
 impl<'e> Guard<'e> {
+    /// Read pointer protected by Hazard eras.
     pub fn read_object<'a: 'e, T: 'a, M>(
         &'e self,
         ptr: &'a impl HazardPointer<'a, T, M>,
@@ -119,21 +121,49 @@ impl<'e> Guard<'e> {
         }
     }
 
+    /// Allocate memory for object protected by Hazard eras.
     pub fn create_object<T>(&self, val: T) -> *mut HazardObject<T> {
         Box::into_raw(Box::new(HazardObject::new(val, self.eras)))
     }
 
+    /// Retire object and release it memory when it will be safe to do this.
     pub fn retire<T>(&self, retired_object: &HazardObject<T>) {
-        self.eras
-            .retire(retired_object as *const HazardObject<T> as *mut HazardObject<T>);
+        if self.instant_retire {
+            unsafe {
+                drop(Box::from_raw(
+                    retired_object as *const HazardObject<T> as *mut HazardObject<T>,
+                ));
+            }
+        } else {
+            self.eras
+                .retire(retired_object as *const HazardObject<T> as *mut HazardObject<T>);
+        }
     }
 
+    /// Create new guard.
+    ///
+    /// This method usually used for 'local scoped' operations which should
+    /// release all protected pointers asap. For instance, data structure(DS1) requires guard for it
+    /// insert operation. Insert method implementation have to scan some other
+    /// internal concurrent structure(DS2) which also requires guard object. Suppose, insert
+    /// method of DS1 is not holding any references to DS2 at the moment, when it returns control
+    /// to caller. If 'DS1 insert' will use guard(passed by caller) to scan DS2, when all read
+    /// references of DS2 will not be retired until this guard is alive. But 'DS1 insert' ensures
+    /// that all DS2 retired references can be released before it returns. In this case, 'DS1
+    /// insert' creates new 'local scoped' guard to scan DS2 and drops new guard at the end.
     pub fn new_guard(&self) -> Guard {
         self.eras.new_guard()
     }
 
+    /// Create guard which is not protect during the reads and retire pointers instantly.
     pub fn unprotected(&self) -> Guard {
-        self.eras.unprotected()
+        self.eras.unprotected_guard()
+    }
+
+    /// Returns guard which do not protect reads, but defer pointer retirement until it will be
+    /// safe to do this.
+    fn read_unprotected(&self) -> Guard {
+        self.eras.read_unprotected_guard()
     }
 }
 
@@ -162,13 +192,23 @@ impl HazardEras {
         Guard {
             eras: self,
             active_pointers: Some(UnsafeCell::new(HashSet::new())),
+            instant_retire: false,
         }
     }
 
-    pub const fn unprotected(&self) -> Guard {
+    pub const fn unprotected_guard(&self) -> Guard {
         Guard {
             eras: self,
             active_pointers: None,
+            instant_retire: true,
+        }
+    }
+
+    const fn read_unprotected_guard(&self) -> Guard {
+        Guard {
+            eras: self,
+            active_pointers: None,
+            instant_retire: false,
         }
     }
 
@@ -191,7 +231,7 @@ impl HazardEras {
                         drop(Box::from_raw(obj_addr as *mut HazardObject<T>))
                     }),
                 },
-                &self.new_guard(),
+                &self.unprotected_guard(),
             );
         }
 
@@ -215,6 +255,7 @@ impl HazardEras {
 
             // hazard object not used by any thread, drop it
             (&retired.drop_fn)();
+            retired_tls.remove(|e| ptr::eq(e, retired), &self.unprotected_guard());
         }
     }
 
@@ -283,7 +324,7 @@ impl HazardEras {
                 // from it. Thus, we do not need to track references which will be read during
                 // remove operation. All pointers read by remove method will be retired only when
                 // other threads will complete there scan operations.
-                let unprotected = &guard.unprotected();
+                let unprotected = &guard.read_unprotected();
                 for p in (&*read_ptrs.get()).iter() {
                     let res = self.get_read_eras().remove(
                         |state| state as *const HazardPtrReadState == *p,
@@ -308,8 +349,11 @@ impl HazardEras {
     fn get_thread_state(&self) -> (&LockFreeList<HazardPtrReadState>, &LockFreeList<Retired>) {
         HAZARD_TID.with(|map| {
             let addr = self as *const HazardEras as usize;
-            let (read_list, retired_list) = map.borrow().get(&addr).copied().unwrap_or_else(|| {
-                let guard = self.new_guard();
+            let map_ref = map.borrow();
+            let thread_state = map_ref.get(&addr).copied();
+            drop(map_ref);
+            let (read_list, retired_list) = thread_state.unwrap_or_else(|| {
+                let guard = self.unprotected_guard();
                 let read_list = self.thread_eras.add(LockFreeList::new(), &guard);
                 let retire_list = self.retired.add(LockFreeList::new(), &guard);
                 map.borrow_mut().insert(
