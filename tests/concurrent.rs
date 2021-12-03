@@ -117,7 +117,6 @@ fn insert_of_non_overlaping_keys_and_search() {
             .unwrap();
         },
     );
-    mem::forget(he_val);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::option::Option::Some;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::{ptr, thread_local};
 
 thread_local! {
@@ -115,9 +115,9 @@ impl<'e> Guard<'e> {
         ptr: &'a impl HazardPointer<'a, T, M>,
     ) -> Option<PointerValue<'e, T, M>> {
         if let Some(read_ptrs) = &self.active_pointers {
-            let (p, read_state) = self.eras.read(ptr);
+            let (p, ptr_state) = self.eras.read(ptr);
             let read_set = unsafe { &mut *read_ptrs.get() };
-            read_set.insert(read_state);
+            read_set.insert(ptr_state);
             p
         } else {
             self.eras.read_unprotected(ptr)
@@ -133,9 +133,9 @@ impl<'e> Guard<'e> {
     pub fn retire<T>(&self, retired_object: &HazardObject<T>) {
         if self.instant_retire {
             unsafe {
-                drop(Box::from_raw(
-                    retired_object as *const HazardObject<T> as *mut HazardObject<T>,
-                ));
+                let boxed_object =
+                    Box::from_raw(retired_object as *const HazardObject<T> as *mut HazardObject<T>);
+                drop(boxed_object);
             }
         } else {
             self.eras
@@ -154,18 +154,18 @@ impl<'e> Guard<'e> {
     /// references of DS2 will not be retired until this guard is alive. But 'DS1 insert' ensures
     /// that all DS2 retired references can be released before it returns. In this case, 'DS1
     /// insert' creates new 'local scoped' guard to scan DS2 and drops new guard at the end.
-    pub fn new_guard(&self) -> Guard {
+    pub fn new_guard(&mut self) -> Guard {
         self.eras.new_guard()
     }
 
     /// Create guard which is not protect during the reads and retire pointers instantly.
-    pub fn unprotected(&self) -> Guard {
+    pub fn unprotected(&mut self) -> Guard {
         self.eras.unprotected_guard()
     }
 
     /// Returns guard which do not protect reads, but defer pointer retirement until it will be
     /// safe to do this.
-    fn read_unprotected(&self) -> Guard {
+    fn read_unprotected(&mut self) -> Guard {
         self.eras.read_unprotected_guard()
     }
 }
@@ -230,16 +230,37 @@ impl HazardEras {
         let obj_addr = obj as usize;
         let guard = self.unprotected_guard();
         unsafe {
-            retired_tls.add(
-                Retired {
-                    create_era: (*obj).create_era,
-                    delete_era: Era(cur_era),
-                    drop_fn: Box::new(move || {
-                        drop(Box::from_raw(obj_addr as *mut HazardObject<T>))
-                    }),
-                },
-                &guard,
-            );
+            retired_tls
+                .find(|e| !e.in_use.load(Ordering::Relaxed), &guard)
+                .map_or_else(
+                    || {
+                        let drop_fn = Box::new(DropFuncWrapper {
+                            func: (Box::new(move || {
+                                drop(Box::from_raw(obj_addr as *mut HazardObject<T>));
+                            })),
+                        });
+                        retired_tls.add(
+                            Retired {
+                                create_era: AtomicU64::new((*obj).create_era.0),
+                                delete_era: AtomicU64::new(cur_era),
+                                drop_fn: AtomicPtr::new(Box::into_raw(drop_fn)),
+                                in_use: AtomicBool::new(true),
+                            },
+                            &guard,
+                        );
+                    },
+                    |e| {
+                        let drop_fn = Box::new(DropFuncWrapper {
+                            func: (Box::new(move || {
+                                drop(Box::from_raw(obj_addr as *mut HazardObject<T>));
+                            })),
+                        });
+                        e.drop_fn.store(Box::into_raw(drop_fn), Ordering::SeqCst);
+                        e.create_era.store((*obj).create_era.0, Ordering::SeqCst);
+                        e.delete_era.store(cur_era, Ordering::SeqCst);
+                        e.in_use.store(true, Ordering::SeqCst);
+                    },
+                )
         }
 
         // if some other thread already increase era number, we can skip expensive atomic store
@@ -264,10 +285,15 @@ impl HazardEras {
 
         let protected_guard = self.new_guard();
         'r: for retired in retired_tls.iter(&guard) {
+            if !retired.in_use.load(Ordering::Relaxed) {
+                continue;
+            }
             for read_list in self.thread_eras.iter(&protected_guard) {
                 for e in read_list.iter(&protected_guard) {
                     let era = e.era.load(Ordering::Relaxed);
-                    if retired.create_era >= era && retired.delete_era <= era {
+                    if retired.create_era.load(Ordering::Relaxed) >= era
+                        && retired.delete_era.load(Ordering::Relaxed) <= era
+                    {
                         // era of some thread, which reads hazard pointer, overlaps with
                         // lifetime of retired object. Skip retirement until this thread will
                         // release reference to hazard object.
@@ -277,8 +303,12 @@ impl HazardEras {
             }
 
             // hazard object not used by any thread, drop it
-            (&retired.drop_fn)();
-            retired_tls.remove(|e| ptr::eq(e, retired), &guard);
+            retired.in_use.store(false, Ordering::SeqCst);
+            unsafe {
+                let pointer =
+                    Box::from_raw(retired.drop_fn.swap(ptr::null_mut(), Ordering::SeqCst));
+                (pointer.func)();
+            }
         }
     }
 
@@ -293,12 +323,25 @@ impl HazardEras {
         // several reads of same pointer by caller thread and we will release memory which can
         // still be used by this thread.
         let create_era = self.clock.load(Ordering::SeqCst);
-        let state = self.get_read_eras().add(
-            HazardPtrReadState {
-                era: AtomicU64::new(create_era),
-            },
-            &self.new_guard(),
-        );
+        let guard = self.unprotected_guard();
+        let state = self
+            .get_read_eras()
+            .find(|s| !s.in_use.load(Ordering::Relaxed), &guard)
+            .map_or_else(
+                || {
+                    self.get_read_eras().add(
+                        HazardPtrReadState {
+                            era: AtomicU64::new(create_era),
+                            in_use: AtomicBool::new(true),
+                        },
+                        &guard,
+                    )
+                },
+                |s| {
+                    s.in_use.store(true, Ordering::SeqCst);
+                    s
+                },
+            );
 
         let mut read_era = state.era.load(Ordering::SeqCst);
         loop {
@@ -336,10 +379,10 @@ impl HazardEras {
     /// Remove 'read state' for each pointer registered in passed guard.
     /// This method called when thread completes reading bunch of pointers and finish processing
     /// them. Now, old values, related to these pointers, can be retired.
-    fn drop_guard(&self, guard: &Guard) {
+    fn drop_guard(&self, guard: &mut Guard) {
         unsafe {
             if let Some(read_ptrs) = &guard.active_pointers {
-                let unprotected = &guard.read_unprotected();
+                let unprotected = self.unprotected_guard();
                 // use 'unprotected' guard to prevent recursive drop of guard
                 // unprotected guard do not track pointers which were read through it and hence
                 // it will not require any state inside HE structure.
@@ -350,10 +393,9 @@ impl HazardEras {
                 // other threads will complete there scan operations.
                 let read_list_tls = self.get_read_eras();
                 for p in (&*read_ptrs.get()).iter() {
-                    let res = read_list_tls.remove(
-                        |state| state as *const HazardPtrReadState == *p,
-                        unprotected,
-                    );
+                    let res = read_list_tls
+                        .find(|state| ptr::eq(state, *p), &unprotected)
+                        .map(|s| s.in_use.store(false, Ordering::SeqCst));
                     debug_assert!(res.is_some());
                 }
             }
@@ -405,23 +447,41 @@ impl HazardEras {
 impl Drop for HazardEras {
     fn drop(&mut self) {
         let guard = self.unprotected_guard();
-        for ptrs in self.retired.iter(&guard) {
-            for retired in ptrs.iter(&guard) {
-                (&retired.drop_fn)();
+        while let Some(list) = self.retired.remove(|_| true, &guard) {
+            while list.remove(|_| true, &guard).is_some() {}
+        }
+        while let Some(list) = self.thread_eras.remove(|_| true, &guard) {
+            while list.remove(|_| true, &guard).is_some() {}
+        }
+    }
+}
+
+struct DropFuncWrapper {
+    func: Box<dyn Fn()>,
+}
+
+struct Retired {
+    drop_fn: AtomicPtr<DropFuncWrapper>,
+    create_era: AtomicU64,
+    delete_era: AtomicU64,
+    in_use: AtomicBool,
+}
+
+impl Drop for Retired {
+    fn drop(&mut self) {
+        if self.in_use.load(Ordering::Relaxed) {
+            self.in_use.store(false, Ordering::SeqCst);
+            unsafe {
+                let pointer = Box::from_raw(self.drop_fn.load(Ordering::SeqCst));
+                (pointer.func)();
             }
         }
     }
 }
 
-struct Retired {
-    drop_fn: Box<dyn Fn()>,
-    create_era: Era,
-    delete_era: Era,
-}
-
-#[repr(transparent)]
 struct HazardPtrReadState {
     era: AtomicU64,
+    in_use: AtomicBool,
 }
 
 impl Eq for HazardPtrReadState {}
@@ -455,8 +515,17 @@ impl Hash for HazardPtrReadState {
 
 #[cfg(test)]
 mod tests {
+    use crate::stamped_ptr::StampedPointer;
+    use crate::HazardEras;
+
     #[test]
     fn it_works() {
-        assert_eq!(2 + 2, 4);
+        let he = HazardEras::new();
+        let mut guard = he.new_guard();
+        let guard1 = guard.new_guard();
+        let ptr = StampedPointer::<u32>::default();
+        let option = guard1.read_object(&ptr);
+        drop(guard1);
+        let option = guard.read_object(&ptr);
     }
 }
