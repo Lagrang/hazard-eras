@@ -14,3 +14,5 @@ include = ["src/", "LICENSE", "README.md", "CHANGELOG.md"]
 
 [dev-dependencies]
 rand = "0.8.3"
+crossbeam-utils = "0.8.4"
+num_cpus = "1.11.1"

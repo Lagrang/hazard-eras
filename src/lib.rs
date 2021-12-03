@@ -1,11 +1,11 @@
 #![feature(stdsimd)]
 
-mod list;
+pub mod list;
 mod stamped_ptr;
 
 use list::LockFreeList;
 use std::borrow::Borrow;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -17,6 +17,7 @@ thread_local! {
     // thread local map contains pointer to internal structures of hazard eras(address
     // of this structure is key of the hashmap)
     static HAZARD_TID: RefCell<HashMap<usize, (usize, usize)>> = RefCell::new(HashMap::new());
+    static RETIRE_COUNTER: Cell<usize> = Cell::new(0);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +37,7 @@ impl PartialEq<u64> for Era {
 }
 
 const ERA_NOT_SET: u64 = 0;
+const RETIRE_THRESHOLD: usize = 128;
 
 pub trait HazardPointer<'a, T, M> {
     fn load(&'a self, ord: Ordering) -> Option<PointerValue<'a, T, M>>;
@@ -114,7 +116,8 @@ impl<'e> Guard<'e> {
     ) -> Option<PointerValue<'e, T, M>> {
         if let Some(read_ptrs) = &self.active_pointers {
             let (p, read_state) = self.eras.read(ptr);
-            unsafe { &mut *read_ptrs.get() }.insert(read_state);
+            let read_set = unsafe { &mut *read_ptrs.get() };
+            read_set.insert(read_state);
             p
         } else {
             self.eras.read_unprotected(ptr)
@@ -179,6 +182,9 @@ pub struct HazardEras {
     retired: LockFreeList<LockFreeList<Retired>>,
 }
 
+unsafe impl Send for HazardEras {}
+unsafe impl Sync for HazardEras {}
+
 impl HazardEras {
     pub fn new() -> Self {
         Self {
@@ -222,6 +228,7 @@ impl HazardEras {
         let cur_era = self.clock.load(Ordering::SeqCst);
         let retired_tls = self.get_retired();
         let obj_addr = obj as usize;
+        let guard = self.unprotected_guard();
         unsafe {
             retired_tls.add(
                 Retired {
@@ -231,7 +238,7 @@ impl HazardEras {
                         drop(Box::from_raw(obj_addr as *mut HazardObject<T>))
                     }),
                 },
-                &self.unprotected_guard(),
+                &guard,
             );
         }
 
@@ -240,9 +247,25 @@ impl HazardEras {
             self.clock.fetch_add(1, Ordering::SeqCst);
         }
 
-        'r: for retired in retired_tls.iter() {
-            for read_list in self.thread_eras.iter() {
-                for e in read_list.iter() {
+        let retire_counter = RETIRE_COUNTER.with(|c| {
+            let cnt = c.get();
+            if cnt < RETIRE_THRESHOLD {
+                c.replace(cnt + 1);
+                cnt
+            } else {
+                c.replace(0);
+                RETIRE_THRESHOLD
+            }
+        });
+
+        if retire_counter < RETIRE_THRESHOLD {
+            return;
+        }
+
+        let protected_guard = self.new_guard();
+        'r: for retired in retired_tls.iter(&guard) {
+            for read_list in self.thread_eras.iter(&protected_guard) {
+                for e in read_list.iter(&protected_guard) {
                     let era = e.era.load(Ordering::Relaxed);
                     if retired.create_era >= era && retired.delete_era <= era {
                         // era of some thread, which reads hazard pointer, overlaps with
@@ -255,7 +278,7 @@ impl HazardEras {
 
             // hazard object not used by any thread, drop it
             (&retired.drop_fn)();
-            retired_tls.remove(|e| ptr::eq(e, retired), &self.unprotected_guard());
+            retired_tls.remove(|e| ptr::eq(e, retired), &guard);
         }
     }
 
@@ -316,6 +339,7 @@ impl HazardEras {
     fn drop_guard(&self, guard: &Guard) {
         unsafe {
             if let Some(read_ptrs) = &guard.active_pointers {
+                let unprotected = &guard.read_unprotected();
                 // use 'unprotected' guard to prevent recursive drop of guard
                 // unprotected guard do not track pointers which were read through it and hence
                 // it will not require any state inside HE structure.
@@ -324,13 +348,13 @@ impl HazardEras {
                 // from it. Thus, we do not need to track references which will be read during
                 // remove operation. All pointers read by remove method will be retired only when
                 // other threads will complete there scan operations.
-                let unprotected = &guard.read_unprotected();
+                let read_list_tls = self.get_read_eras();
                 for p in (&*read_ptrs.get()).iter() {
-                    let res = self.get_read_eras().remove(
+                    let res = read_list_tls.remove(
                         |state| state as *const HazardPtrReadState == *p,
                         unprotected,
                     );
-                    debug_assert!(res);
+                    debug_assert!(res.is_some());
                 }
             }
         }
@@ -380,8 +404,9 @@ impl HazardEras {
 
 impl Drop for HazardEras {
     fn drop(&mut self) {
-        for ptrs in self.retired.iter() {
-            for retired in ptrs.iter() {
+        let guard = self.unprotected_guard();
+        for ptrs in self.retired.iter(&guard) {
+            for retired in ptrs.iter(&guard) {
                 (&retired.drop_fn)();
             }
         }

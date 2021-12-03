@@ -12,6 +12,9 @@ pub struct StampedPointer<T> {
     phantom: PhantomData<T>,
 }
 
+unsafe impl<T> Send for StampedPointer<T> {}
+unsafe impl<T> Sync for StampedPointer<T> {}
+
 #[derive(Debug, Copy, Clone)]
 pub struct VersionedPtr<T> {
     pointer: *mut T,

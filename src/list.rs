@@ -16,6 +16,9 @@ struct Node<T> {
 const LIVE_NODE: u64 = 0;
 const REMOVED_NODE: u64 = 1;
 
+unsafe impl<T> Send for LockFreeList<T> {}
+unsafe impl<T> Sync for LockFreeList<T> {}
+
 impl<T> LockFreeList<T> {
     pub fn new() -> Self {
         Self {
@@ -50,7 +53,7 @@ impl<T> LockFreeList<T> {
         }
     }
 
-    pub fn remove(&self, predicate: impl Fn(&T) -> bool, guard: &Guard) -> bool {
+    pub fn remove<'g>(&'g self, predicate: impl Fn(&T) -> bool, guard: &'g Guard) -> Option<&'g T> {
         loop {
             if let Some(search_res) = self.search(&predicate, guard) {
                 let next_snap = &search_res.found_node.next_snapshot;
@@ -115,13 +118,22 @@ impl<T> LockFreeList<T> {
                         // We run search again to help to remove node.
                         self.search(&predicate, guard);
                     }
-                    return true;
+                    return Some(&search_res.found_node.node_ptr.value.object.value);
                 }
                 // node already marked as removed by other thread, retry
             } else {
-                return false;
+                return None;
             }
         }
+    }
+
+    pub fn find<'s: 'g, 'g>(
+        &'s self,
+        predicate: impl Fn(&T) -> bool,
+        guard: &'g Guard<'g>,
+    ) -> Option<&'g T> {
+        self.search(&predicate, guard)
+            .map(|s| &s.found_node.node_ptr.value.object.value)
     }
 
     fn search<'s: 'g, 'g>(
@@ -204,9 +216,10 @@ impl<T> LockFreeList<T> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl Iterator<Item = &'g T> {
         fence(Ordering::SeqCst);
-        HazardPointer::load(&self.head, Ordering::Relaxed)
+        guard
+            .read_object(&self.head)
             .map(|h| Iter::new(&h.value.object))
             .unwrap_or_else(|| Iter::empty())
     }
@@ -261,7 +274,7 @@ mod tests {
         let list = LockFreeList::new();
         for i in 0..100 {
             assert_eq!(*list.add(i, &he.new_guard()), i);
-            let res_list: Vec<i32> = list.iter().copied().collect();
+            let res_list: Vec<i32> = list.iter(&he.new_guard()).copied().collect();
             let expected: Vec<i32> = (0..=i).rev().collect();
             assert_eq!(res_list, expected);
         }
@@ -276,13 +289,13 @@ mod tests {
         }
 
         for i in 0..100 {
-            assert!(list.remove(|v| *v == i, &he.new_guard()));
-            let res_list: Vec<i32> = list.iter().copied().collect();
+            assert!(list.remove(|v| *v == i, &he.new_guard()).is_some());
+            let res_list: Vec<i32> = list.iter(&he.new_guard()).copied().collect();
             let expected: Vec<i32> = (i + 1..100).rev().collect();
             assert_eq!(res_list, expected);
         }
 
-        assert!(list.iter().next().is_none());
+        assert!(list.iter(&he.new_guard()).next().is_none());
     }
 
     #[test]
@@ -294,8 +307,8 @@ mod tests {
         }
 
         for i in (0..100).rev() {
-            assert!(list.remove(|v| *v == i, &he.new_guard()));
-            let res_list: Vec<i32> = list.iter().copied().collect();
+            assert!(list.remove(|v| *v == i, &he.new_guard()).is_some());
+            let res_list: Vec<i32> = list.iter(&he.new_guard()).copied().collect();
             let expected: Vec<i32> = if i == 0 {
                 vec![]
             } else {
@@ -304,7 +317,7 @@ mod tests {
             assert_eq!(res_list, expected);
         }
 
-        assert!(list.iter().next().is_none());
+        assert!(list.iter(&he.new_guard()).next().is_none());
     }
 
     #[test]
@@ -318,10 +331,10 @@ mod tests {
         let mut removal_list: Vec<i32> = (0..100).collect();
         removal_list.shuffle(&mut thread_rng());
         for i in &removal_list {
-            assert!(list.remove(|v| *v == *i, &he.new_guard()));
-            assert!(!list.iter().any(|v| *v == *i));
+            assert!(list.remove(|v| *v == *i, &he.new_guard()).is_some());
+            assert!(!list.iter(&he.new_guard()).any(|v| *v == *i));
         }
 
-        assert!(list.iter().next().is_none());
+        assert!(list.iter(&he.new_guard()).next().is_none());
     }
 }
