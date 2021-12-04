@@ -9,7 +9,6 @@ use hazard_eras::list::LockFreeList;
 use hazard_eras::{Guard, HazardEras};
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::mem;
 
 mod history_verifier;
 
@@ -125,6 +124,10 @@ fn upsert_of_overlaping_keys() {
     test(
         || Box::new(LockFreeList::new()),
         |ds, threads, thread_changes_count| {
+            if !ds.is_upsert_supported() {
+                return;
+            }
+
             let ds = ds.as_ref();
             let mut per_thread_elem_set = Vec::new();
             for _ in 0..threads {
@@ -193,7 +196,7 @@ fn add_and_delete() {
                             let key = i.to_string();
                             let value = thread_rng().gen_range(1..100000);
                             let start = Instant::now();
-                            if thread_rng().gen_bool(0.4) {
+                            if ds.is_upsert_supported() && thread_rng().gen_bool(0.4) {
                                 ds.upsert(key.clone(), value, &guard);
                                 ops.insert(key, value, start);
                             } else if thread_rng().gen_bool(0.3)
@@ -373,7 +376,7 @@ fn liveness() {
                             let guard = he.new_guard();
                             let key = i.to_string();
                             let value = thread_rng().gen::<usize>();
-                            if thread_rng().gen_bool(0.5) {
+                            if thread_rng().gen_bool(0.5) || !ds.is_upsert_supported() {
                                 ds.insert(key.clone(), value, &guard);
                             } else {
                                 ds.upsert(key.clone(), value, &guard);

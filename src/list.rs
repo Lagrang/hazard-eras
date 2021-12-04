@@ -2,10 +2,9 @@ use crate::stamped_ptr::{StampedPointer, VersionedPtr};
 use crate::Guard;
 use crate::HazardObject;
 use crate::PointerValue;
-use std::ops::RangeInclusive;
 use std::option::Option::Some;
 use std::ptr;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::Ordering;
 
 pub struct LockFreeList<T> {
     head: StampedPointer<HazardObject<Node<T>>>,
@@ -30,10 +29,11 @@ impl<T> LockFreeList<T> {
     }
 
     pub fn add<'a>(&'a self, val: T, guard: &Guard) -> &'a T {
-        let new_node = guard.create_object(Node {
+        let new_node = guard.allocate_object(Node {
             value: val,
             next: StampedPointer::default(),
         });
+        let new_node_ptr = Box::into_raw(new_node);
 
         loop {
             let head_stamped_ptr: Option<PointerValue<HazardObject<Node<T>>, u64>> =
@@ -48,128 +48,23 @@ impl<T> LockFreeList<T> {
                 },
             );
             unsafe {
-                (*new_node).object.next = StampedPointer::new(head_ptr);
+                (*new_node_ptr).object.next = StampedPointer::new(head_ptr);
             }
 
             if self
                 .head
                 .compare_exchange(
                     VersionedPtr::new(head_ptr, head_version),
-                    VersionedPtr::new(new_node, LIVE_NODE),
+                    VersionedPtr::new(new_node_ptr, LIVE_NODE),
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
                 .is_ok()
             {
-                return &unsafe { &*new_node }.get().value;
+                return &(unsafe { &*new_node_ptr }.get().value);
             }
         }
     }
-
-    /// Remove all values between passed range. If one of range bounds not found, remove will
-    /// return `None`.
-    ///
-    /// This method cannot be concurrently executed by different threads. It can be safely
-    /// concurrently executed only with list iterators.
-    // pub fn remove_range<'g>(
-    //     &'g self,
-    //     range: RangeInclusive<&T>,
-    //     guard: &'g Guard,
-    // ) -> Result<(), ()> {
-    //     // reverse order of range because we insert to the head of list but caller assumes that
-    //     // we insert 'in order'(e.g., to the tail). Caller passes the range and expects that
-    //     // earlier inserted elements will be found in list before later one.
-    //     let search_res = self
-    //         .search(&|val| ptr::eq(val, *range.end()), guard)
-    //         .and_then(|left| {
-    //             self.search(&|val| ptr::eq(val, *range.start()), guard)
-    //                 .map(|right| (left, right))
-    //         });
-    //
-    //     if let Some((left, right)) = search_res {
-    //         let next_snap = &right.found_node.next_snapshot;
-    //         let next_ptr = if !next_snap.pointer().is_null() {
-    //             let right_node = unsafe { &*next_snap.pointer() }.get();
-    //             let right_ptr = right_node.next.load(Ordering::SeqCst);
-    //             if right_ptr.version() == REMOVED_NODE {
-    //                 // next node was removed
-    //                 return Err(());
-    //             }
-    //             VersionedPtr::new(next_snap.pointer(), LIVE_NODE)
-    //         } else {
-    //             // there is no next node, e.g. we trying to remove last node in list
-    //             VersionedPtr::new(ptr::null_mut(), LIVE_NODE)
-    //         };
-    //
-    //         let removed_marker =
-    //             VersionedPtr::new(left.found_node.next_snapshot.pointer(), REMOVED_NODE);
-    //         let (mut cur, mut next) = (
-    //             left.found_node.node_ptr.value,
-    //             left.found_node.next_snapshot.pointer(),
-    //         );
-    //         // mark found node as removed
-    //         if left
-    //             .found_node
-    //             .node_ptr
-    //             .get()
-    //             .next
-    //             .compare_exchange(
-    //                 left.found_node.next_snapshot,
-    //                 removed_marker,
-    //                 Ordering::SeqCst,
-    //                 Ordering::SeqCst,
-    //             )
-    //             .is_ok()
-    //         {
-    //             let result = if let Some(prev) = left.prev {
-    //                 // update 'next' pointer of node which is precedes found node, to unlink
-    //                 // removed node from list
-    //                 prev.node_ptr.get().next.compare_exchange(
-    //                     prev.next_snapshot,
-    //                     next_ptr,
-    //                     Ordering::SeqCst,
-    //                     Ordering::SeqCst,
-    //                 )
-    //             } else {
-    //                 // found node is a list head, update it to unlink removed node
-    //                 self.head.compare_exchange(
-    //                     VersionedPtr::new(
-    //                         left.found_node.node_ptr.value as *const HazardObject<Node<T>>
-    //                             as *mut HazardObject<Node<T>>,
-    //                         LIVE_NODE,
-    //                     ),
-    //                     next_ptr,
-    //                     Ordering::SeqCst,
-    //                     Ordering::SeqCst,
-    //                 )
-    //             };
-    //
-    //             if result.is_ok() {
-    //                 // nodes unlinked from list and can be retired
-    //                 let until = right.found_node.next_snapshot.pointer();
-    //                 loop {
-    //                     guard.retire(cur);
-    //                     if next == until {
-    //                         break;
-    //                     }
-    //                     cur = unsafe { &*(next as *const HazardObject<Node<T>>) };
-    //                     next = cur.object.next.load(Ordering::Relaxed).pointer();
-    //                 }
-    //             } else {
-    //                 // someone change pointer in 'previous' node
-    //                 panic!(
-    //                     "Range remove cannot be executed concurrently with other remove methods"
-    //                 );
-    //             }
-    //             return Ok(());
-    //         }
-    //         // node already marked as removed by other thread
-    //         panic!("Range remove cannot be executed concurrently with other remove methods");
-    //     } else {
-    //         Err(())
-    //     }
-    // }
-    //
 
     pub fn remove<'g>(&'g self, predicate: impl Fn(&T) -> bool, guard: &'g Guard) -> Option<&'g T> {
         loop {
@@ -215,7 +110,6 @@ impl<T> LockFreeList<T> {
                         )
                     } else {
                         // found node is a list head, update it to unlink removed node
-                        let ptr1 = self.head.load(Ordering::SeqCst);
                         self.head.compare_exchange(
                             VersionedPtr::new(
                                 search_res.found_node.node_ptr.value as *const HazardObject<Node<T>>
@@ -268,9 +162,9 @@ impl<T> LockFreeList<T> {
                 let cur_node_version = cur_node_ptr.metadata;
                 let next = cur_node.get().next.load(Ordering::SeqCst);
 
+                // restart search if previous node was changed, e.g. the next pointer was updated
+                // and it no longer points to current node.
                 if let Some(p) = &prev {
-                    // restart search if previous node already points to some other next node
-                    // which is not equals to current
                     if p.next_snapshot
                         != VersionedPtr::new(
                             cur_node as *const HazardObject<Node<T>> as *mut HazardObject<Node<T>>,
@@ -283,8 +177,11 @@ impl<T> LockFreeList<T> {
                     }
                 }
 
+                // if current node marked as removed, we should help other thread to complete
+                // this removal.
                 if next.version() == REMOVED_NODE {
-                    // current node marked to remove
+                    // update next pointer of previous node to points to node which stored in
+                    // 'next' pointer of 'removed' node.
                     let result = if let Some(pred) = prev {
                         pred.node_ptr.get().next.compare_exchange(
                             pred.next_snapshot,
@@ -335,7 +232,6 @@ impl<T> LockFreeList<T> {
     }
 
     pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl Iterator<Item = &'g T> {
-        fence(Ordering::SeqCst);
         guard
             .read_object(&self.head)
             .map(|h| Iter::new(&h.value.object, guard))
@@ -500,28 +396,4 @@ mod tests {
         assert!(list.iter(&he.new_guard()).next().is_none());
         assert!(list.remove(|_| true, &he.new_guard()).is_none());
     }
-
-    // #[test]
-    // fn range_remove() {
-    //     let he = HazardEras::new();
-    //     let list = LockFreeList::new();
-    //     let zero = list.add(0, &he.new_guard());
-    //     let one = list.add(1, &he.new_guard());
-    //     let two = list.add(2, &he.new_guard());
-    //     let third = list.add(3, &he.new_guard());
-    //     let fourth = list.add(4, &he.new_guard());
-    //
-    //     assert!(list.remove_range(third..=fourth, &he.new_guard()).is_ok());
-    //     let res_list: Vec<i32> = list.iter(&he.new_guard()).copied().collect();
-    //     let expected: Vec<i32> = (0..3).rev().collect();
-    //     assert_eq!(res_list, expected);
-    //
-    //     assert!(list.remove_range(zero..=one, &he.new_guard()).is_ok());
-    //     let res_list: Vec<i32> = list.iter(&he.new_guard()).copied().collect();
-    //     let expected: Vec<i32> = (2..=2).rev().collect();
-    //     assert_eq!(res_list, expected);
-    //
-    //     assert!(list.remove_range(two..=two, &he.new_guard()).is_ok());
-    //     assert!(list.iter(&he.new_guard()).next().is_none());
-    // }
 }
