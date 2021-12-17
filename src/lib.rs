@@ -278,8 +278,11 @@ impl HazardEras {
             .collect();
 
         for read_list in self.thread_eras.iter(&guard) {
-            for e in read_list.iter(&guard) {
-                let era = e.era.load(Ordering::Relaxed);
+            for read_state in read_list.iter(&guard) {
+                if !read_state.in_use.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let era = read_state.era.load(Ordering::Relaxed);
                 for (retired, has_refs) in &mut retired {
                     if retired.create_era.get() >= era && retired.delete_era.get() <= era {
                         // era of some thread, which reads hazard pointer, overlaps with
@@ -301,15 +304,16 @@ impl HazardEras {
         }
 
         // 'r: for retired in retired_tls.iter(&guard) {
-        //     if !retired.in_use.load(Ordering::Relaxed) {
+        //     if !retired.in_use.get() {
         //         continue;
         //     }
-        //     for read_list in self.thread_eras.iter(&protected_guard) {
-        //         for e in read_list.iter(&protected_guard) {
+        //     for read_list in self.thread_eras.iter(&guard) {
+        //         for e in read_list.iter(&guard) {
+        //             if !e.in_use.load(Ordering::Relaxed) {
+        //                 continue;
+        //             }
         //             let era = e.era.load(Ordering::Relaxed);
-        //             if retired.create_era.load(Ordering::Relaxed) >= era
-        //                 && retired.delete_era.load(Ordering::Relaxed) <= era
-        //             {
+        //             if retired.create_era.get() >= era && retired.delete_era.get() <= era {
         //                 // era of some thread, which reads hazard pointer, overlaps with
         //                 // lifetime of retired object. Skip retirement until this thread will
         //                 // release reference to hazard object.
@@ -319,10 +323,9 @@ impl HazardEras {
         //     }
         //
         //     // hazard object not used by any thread, drop it
-        //     let drop_fn = retired.drop_fn.swap(ptr::null_mut(), Ordering::SeqCst);
-        //     let drop_fn_pointer = unsafe { Box::from_raw(drop_fn) };
-        //     (drop_fn_pointer.func)();
-        //     retired.in_use.store(false, Ordering::SeqCst);
+        //     let drop_fn = retired.drop_fn.replace(Box::new(|| {}));
+        //     (drop_fn)();
+        //     retired.in_use.set(false);
         // }
     }
 
@@ -358,12 +361,13 @@ impl HazardEras {
                     )
                 },
                 |s| {
+                    s.era.store(create_era, Ordering::SeqCst);
                     s.in_use.store(true, Ordering::SeqCst);
                     s
                 },
             );
 
-        let mut read_era = state.era.load(Ordering::SeqCst);
+        let mut read_era = create_era;
         loop {
             let p = ptr.load(Ordering::SeqCst);
             let cur_era = self.clock.load(Ordering::SeqCst);
@@ -539,7 +543,7 @@ mod tests {
         let per_thread_changes = 25000;
         for mult in 1..=3 {
             let he = HazardEras::new();
-            let vec: Vec<AtomicPtr<HazardObject<String>>> = (0..300)
+            let vec: Vec<AtomicPtr<HazardObject<String>>> = (0..100)
                 .map(|i| {
                     AtomicPtr::new(Box::into_raw(
                         he.unprotected_guard().allocate_object(i.to_string()),
@@ -579,7 +583,8 @@ mod tests {
                                 // simple read of pointer value, to check if it still accessible.
                                 // if implementation contains bug, we can catch SEGFAULT here.
                                 let val = ptr.value.get();
-                                drop(val.clone());
+                                let new = val.clone();
+                                drop(new);
                             }
                         }
                     });
